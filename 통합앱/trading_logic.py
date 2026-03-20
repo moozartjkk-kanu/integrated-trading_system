@@ -137,6 +137,11 @@ class AutoTrader:
         """예수금 캐시 갱신 (main_gui에서 호출)"""
         self._available_funds = amount
 
+    def _is_watchlist_stock(self, code):
+        """종목이 현재 종목리스트에 포함되어 있는지 확인"""
+        watchlist = self.config.get_watchlist() or []
+        return any(item.get("code") == code for item in watchlist if item)
+
     def _pending_key(self, code, intent_type, buy_count=None):
         """pending 키 생성 (추가매수는 차수별로 분리)"""
         if intent_type == "additional_buy":
@@ -801,6 +806,9 @@ class AutoTrader:
         수동매수: 익절1~3 (30/40/30), 메인 기준 매도 없음
         """
         if not position or position.get("quantity", 0) <= 0:
+            return
+
+        if not self._is_watchlist_stock(code):
             return
 
         # 스탑로스 발동 종목은 스탑로스 주문만 유지
