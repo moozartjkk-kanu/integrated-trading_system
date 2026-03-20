@@ -1,0 +1,15 @@
+통합앱/
+├── main_gui.py          ← 통합된 메인 (자동매매 + 종목 탐색)
+├── config.py            ← 자동매매 설정
+├── kiwoom_api.py        ← 자동매매 키움 API
+├── technical_analysis.py
+├── trading_logic.py
+├── event_engine.py
+├── requirements.txt
+├── run.bat              ← 실행 파일
+├── main_gui.spec
+└── search_engine/       ← 종목 탐색 엔진 (자립적 서브폴더)
+    ├── scanner.py
+    ├── config.py        ← 스캔 설정 (scan_config.json)
+    ├── technical_analysis.py
+    └── kiwoom_api.py
