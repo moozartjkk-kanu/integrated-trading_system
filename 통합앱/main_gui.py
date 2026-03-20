@@ -357,6 +357,8 @@ class MainWindow(QMainWindow):
         self._watchlist_refresh_percent = 19
         self._watchlist_refresh_total = 0
         self._watchlist_refresh_done = 0
+        self._watchlist_refresh_generation = 0
+        self._watchlist_refresh_pending_codes = set()
         self._watchlist_loading_dialog = None
         self._holdings_refresh_inflight = False
 
@@ -388,6 +390,18 @@ class MainWindow(QMainWindow):
         self._watchlist_code_to_row = {}
         self._watchlist_rt_screens = ["2000", "2001"]
         self._watchlist_rt_registered = False
+        self._watchlist_rt_refresh_timer = QTimer()
+        self._watchlist_rt_refresh_timer.setSingleShot(True)
+        self._watchlist_rt_refresh_timer.timeout.connect(self._register_watchlist_realtime)
+
+        self._scan_table_refresh_timer = QTimer()
+        self._scan_table_refresh_timer.setSingleShot(True)
+        self._scan_table_refresh_timer.timeout.connect(self._drain_scan_table_refresh)
+        self._scan_table_refresh_generation = 0
+        self._scan_table_refresh_rows = []
+        self._scan_table_refresh_index = 0
+        self._scan_table_refresh_batch_size = 30
+        self._scan_table_refresh_cfg = {}
 
         # ✅ 잔고 변경 디바운스 타이머 (과도한 TR 호출 방지)
         self._balance_changed_timer = QTimer()
@@ -424,6 +438,161 @@ class MainWindow(QMainWindow):
             return f"{int(v):,}"
         except Exception:
             return "-"
+
+    def _schedule_watchlist_realtime_registration(self, delay_ms=150):
+        """감시종목 실시간 재등록을 짧게 디바운스한다."""
+        if not self.kiwoom or not self.kiwoom.is_connected():
+            return
+        self._watchlist_rt_refresh_timer.start(delay_ms)
+
+    def _append_watchlist_row(self, code, name):
+        """감시종목 테이블에 새 행을 추가한다."""
+        row = self.watchlist_table.rowCount()
+        self.watchlist_table.setRowCount(row + 1)
+        self._watchlist_code_to_row[code] = row
+        self.watchlist_table.setItem(row, 0, QTableWidgetItem(code))
+        self.watchlist_table.setItem(row, 1, QTableWidgetItem(name))
+        self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
+        self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
+        self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
+        return row
+
+    def _schedule_scan_table_refresh(self):
+        if not hasattr(self, 'sc_result_table'):
+            return
+
+        self._scan_table_refresh_timer.stop()
+        self._scan_table_refresh_generation += 1
+        self._scan_table_refresh_rows = list(self._scan_result_cache.values())
+        self._scan_table_refresh_index = 0
+        self._scan_table_refresh_cfg = self.scan_config.get_scan() if self.scan_config else {}
+
+        self.sc_result_table.setSortingEnabled(False)
+        self.sc_result_table.clearContents()
+        self.sc_result_table.setRowCount(len(self._scan_table_refresh_rows))
+        self._scan_table_refresh_timer.start(0)
+
+    def _populate_scan_result_row(self, r_idx, row, scan_cfg):
+        code = row.get("code", "")
+        name = row.get("name", "")
+        price = row.get("price", 0)
+        rsi = row.get("rsi")
+        ma = row.get("ma")
+        ma_s = row.get("ma_short")
+        vr = row.get("volume_ratio")
+        bo = row.get("breakout", False)
+        supply_ok = row.get("supply_ok", False)
+        supply_data_available = row.get("supply_data_available", True)
+        tv = row.get("trading_value")
+        tv_ratio = row.get("trading_value_ratio")
+
+        self._sc_set(r_idx, 0, f"{name} ({code})")
+        self._sc_set(
+            r_idx, 1, f"{int(price):,}" if price else "-",
+            align=Qt.AlignRight | Qt.AlignVCenter,
+        )
+
+        rsi_txt = f"{rsi:.1f}" if rsi is not None else "-"
+        item_rsi = self._sc_make_item(rsi_txt, align=Qt.AlignCenter)
+        if rsi is not None:
+            if rsi <= 30:
+                item_rsi.setForeground(QColor("#1565C0"))
+            elif rsi >= 70:
+                item_rsi.setForeground(QColor("#c62828"))
+        self.sc_result_table.setItem(r_idx, 2, item_rsi)
+
+        if ma_s is not None and ma is not None:
+            ma_txt = f"단{int(ma_s):,} / 장{int(ma):,}"
+        elif ma is not None:
+            dir_txt = "↑" if price > ma else "↓"
+            ma_txt = f"{int(ma):,} {dir_txt}"
+        else:
+            ma_txt = "-"
+        self._sc_set(r_idx, 3, ma_txt, align=Qt.AlignCenter)
+
+        vr_txt = f"{vr:.1f}x" if vr is not None else "-"
+        item_vr = self._sc_make_item(vr_txt, align=Qt.AlignCenter)
+        if vr is not None and vr >= float(scan_cfg.get("volume_ratio") or 2):
+            item_vr.setForeground(QColor("#e65100"))
+        self.sc_result_table.setItem(r_idx, 4, item_vr)
+
+        bo_txt = "●" if bo else "-"
+        item_bo = self._sc_make_item(bo_txt, align=Qt.AlignCenter)
+        if bo:
+            item_bo.setForeground(QColor("#2e7d32"))
+        self.sc_result_table.setItem(r_idx, 5, item_bo)
+
+        supply_enabled = bool(scan_cfg.get("supply_enabled"))
+        if not supply_enabled:
+            supply_txt, supply_color = "-", None
+        elif not supply_data_available:
+            supply_txt, supply_color = "?", QColor("#ef6c00")
+        elif supply_ok:
+            supply_txt, supply_color = "●", QColor("#6a1b9a")
+        else:
+            supply_txt, supply_color = "✕", QColor("#9e9e9e")
+        item_sup = self._sc_make_item(supply_txt, align=Qt.AlignCenter)
+        if supply_color:
+            item_sup.setForeground(supply_color)
+        self.sc_result_table.setItem(r_idx, 6, item_sup)
+
+        tv_enabled = bool(scan_cfg.get("trading_value_enabled"))
+        if not tv_enabled or tv is None:
+            tv_txt = "-"
+        else:
+            tv_bil = tv / 100
+            tv_txt = f"{tv_bil:,.0f}억 ({tv_ratio:.0f}%)" if tv_ratio is not None else f"{tv_bil:,.0f}억"
+        item_tv = self._sc_make_item(tv_txt, align=Qt.AlignRight | Qt.AlignVCenter)
+        if tv_enabled and row.get("trading_value_ok"):
+            item_tv.setForeground(QColor("#1565C0"))
+        self.sc_result_table.setItem(r_idx, 7, item_tv)
+
+        conds = []
+        if row.get("rsi_ok"):
+            conds.append("RSI")
+        if row.get("ma_ok"):
+            conds.append("MA")
+        if row.get("volume_ok"):
+            conds.append("거래량")
+        if row.get("breakout"):
+            conds.append("돌파")
+        if row.get("supply_ok"):
+            conds.append("수급")
+        if row.get("trading_value_ok"):
+            conds.append("거래대금")
+        self._sc_set(r_idx, 8, " / ".join(conds) if conds else "-")
+
+    def _drain_scan_table_refresh(self):
+        if not hasattr(self, 'sc_result_table'):
+            return
+
+        rows = self._scan_table_refresh_rows
+        if not rows:
+            self.sc_result_table.setSortingEnabled(True)
+            return
+
+        end = min(
+            self._scan_table_refresh_index + self._scan_table_refresh_batch_size,
+            len(rows),
+        )
+        self.sc_result_table.setUpdatesEnabled(False)
+        try:
+            for r_idx in range(self._scan_table_refresh_index, end):
+                self._populate_scan_result_row(
+                    r_idx,
+                    rows[r_idx],
+                    self._scan_table_refresh_cfg,
+                )
+        finally:
+            self.sc_result_table.setUpdatesEnabled(True)
+
+        self._scan_table_refresh_index = end
+        if self._scan_table_refresh_index < len(rows):
+            self._scan_table_refresh_timer.start(0)
+            return
+
+        self.sc_result_table.setSortingEnabled(True)
+        self.sc_result_table.viewport().update()
 
     def _load_initial_watchlist(self):
         """프로그램 시작 시 저장된 감시 종목 목록 로드 (가격 정보 제외)"""
@@ -1538,6 +1707,9 @@ class MainWindow(QMainWindow):
         if self._is_refreshing_watchlist:
             return
         self._is_refreshing_watchlist = True
+        self._watchlist_refresh_generation += 1
+        generation = self._watchlist_refresh_generation
+        self._watchlist_refresh_pending_codes.clear()
 
         try:
             watchlist = self.config.get_watchlist()
@@ -1551,46 +1723,50 @@ class MainWindow(QMainWindow):
 
             # ✅ 행 수가 다를 때만 setRowCount 호출 (불필요한 리셋 방지)
             current_row_count = self.watchlist_table.rowCount()
-            if current_row_count != len(watchlist):
-                self.watchlist_table.setRowCount(len(watchlist))
+            self.watchlist_table.setUpdatesEnabled(False)
+            try:
+                if current_row_count != len(watchlist):
+                    self.watchlist_table.setRowCount(len(watchlist))
 
-            period = self.config.get("buy", "main_condition_period") or 20
-            percent = self.config.get("buy", "main_condition_percent") or 19
+                period = self.config.get("buy", "main_condition_period") or 20
+                percent = self.config.get("buy", "main_condition_percent") or 19
 
-            # ✅ 코드/이름 매핑 갱신 + 기본 정보 설정 (기존 값 유지)
-            self._watchlist_code_to_row = {}
-            for row, stock in enumerate(watchlist):
-                code = stock["code"]
-                name = stock.get("name", "")
-                self._watchlist_code_to_row[code] = row
-
-                # 코드/이름은 항상 설정 (변경될 수 있음)
-                self.watchlist_table.setItem(row, 0, QTableWidgetItem(code))
-                self.watchlist_table.setItem(row, 1, QTableWidgetItem(name))
-
-                # ✅ 기존 값이 없을 때만 "-"로 초기화 (기존 값 유지)
-                if not self.watchlist_table.item(row, 2):
-                    self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
-                if not self.watchlist_table.item(row, 3):
-                    self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
-                if not self.watchlist_table.item(row, 4):
-                    self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
-
-            # 캐시된 데이터로 먼저 표시 (이벤트 엔진의 배치 스케줄러 캐시 사용)
-            if self.trader and self.trader.event_engine:
-                batch_scheduler = self.trader.event_engine.batch_scheduler
+                # ✅ 코드/이름 매핑 갱신 + 기본 정보 설정 (기존 값 유지)
+                self._watchlist_code_to_row = {}
                 for row, stock in enumerate(watchlist):
                     code = stock["code"]
-                    cached_candles = batch_scheduler.get_cached_candles(code)
-                    if cached_candles:
-                        try:
-                            current_price = cached_candles[0].get("close")
-                            main_condition = self.ta.get_main_condition_levels(cached_candles, period, percent)
-                            self.watchlist_table.setItem(row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price)))
-                            self.watchlist_table.setItem(row, 3, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("ma"))))
-                            self.watchlist_table.setItem(row, 4, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("lower"))))
-                        except Exception as e:
-                            self.log(f"[시스템] 감시 종목 지표 갱신 실패: {code} ({e})")
+                    name = stock.get("name", "")
+                    self._watchlist_code_to_row[code] = row
+
+                    # 코드/이름은 항상 설정 (변경될 수 있음)
+                    self.watchlist_table.setItem(row, 0, QTableWidgetItem(code))
+                    self.watchlist_table.setItem(row, 1, QTableWidgetItem(name))
+
+                    # ✅ 기존 값이 없을 때만 "-"로 초기화 (기존 값 유지)
+                    if not self.watchlist_table.item(row, 2):
+                        self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
+                    if not self.watchlist_table.item(row, 3):
+                        self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
+                    if not self.watchlist_table.item(row, 4):
+                        self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
+
+                # 캐시된 데이터로 먼저 표시 (이벤트 엔진의 배치 스케줄러 캐시 사용)
+                if self.trader and self.trader.event_engine:
+                    batch_scheduler = self.trader.event_engine.batch_scheduler
+                    for row, stock in enumerate(watchlist):
+                        code = stock["code"]
+                        cached_candles = batch_scheduler.get_cached_candles(code)
+                        if cached_candles:
+                            try:
+                                current_price = cached_candles[0].get("close")
+                                main_condition = self.ta.get_main_condition_levels(cached_candles, period, percent)
+                                self.watchlist_table.setItem(row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price)))
+                                self.watchlist_table.setItem(row, 3, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("ma"))))
+                                self.watchlist_table.setItem(row, 4, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("lower"))))
+                            except Exception as e:
+                                self.log(f"[시스템] 감시 종목 지표 갱신 실패: {code} ({e})")
+            finally:
+                self.watchlist_table.setUpdatesEnabled(True)
 
             self.watchlist_table.viewport().update()
 
@@ -1602,7 +1778,10 @@ class MainWindow(QMainWindow):
                 if self.trader and self.trader.event_engine:
                     has_cache = self.trader.event_engine.batch_scheduler.is_cache_valid(code)
                 if not has_cache:
-                    self._watchlist_refresh_queue.append((row, stock))
+                    self._watchlist_refresh_queue.append(
+                        {"generation": generation, "row": row, "code": code}
+                    )
+                    self._watchlist_refresh_pending_codes.add(code)
 
             self._watchlist_refresh_period = period
             self._watchlist_refresh_percent = percent
@@ -1614,7 +1793,7 @@ class MainWindow(QMainWindow):
                 self.log(f"[시스템] 종목 정보 조회 시작: {self._watchlist_refresh_total}개 종목")
                 if show_loading:
                     self._show_watchlist_loading_dialog()
-                QTimer.singleShot(100, self._refresh_watchlist_next)
+                QTimer.singleShot(100, lambda g=generation: self._refresh_watchlist_next(g))
             else:
                 self._is_refreshing_watchlist = False
                 if not self.kiwoom or not self.kiwoom.is_connected():
@@ -1624,7 +1803,7 @@ class MainWindow(QMainWindow):
             self.log(f"[시스템] 감시 종목 갱신 오류: {e}")
             self._is_refreshing_watchlist = False
 
-        self._refresh_watchlist_realtime_registration()
+        self._schedule_watchlist_realtime_registration()
 
     def _refresh_watchlist_for_codes(self, codes, show_loading=False):
         """선택 종목만 부분 갱신 (일봉 TR은 필요한 종목만 큐에 추가)"""
@@ -1638,42 +1817,47 @@ class MainWindow(QMainWindow):
         percent = self.config.get("buy", "main_condition_percent") or 19
 
         to_queue = []
+        generation = self._watchlist_refresh_generation
 
         # 캐시가 있으면 즉시 반영, 없으면 TR 큐에 추가
-        for code in codes:
-            row = self._watchlist_code_to_row.get(code)
-            if row is None:
-                continue
+        self.watchlist_table.setUpdatesEnabled(False)
+        try:
+            for code in codes:
+                row = self._watchlist_code_to_row.get(code)
+                if row is None:
+                    continue
 
-            has_cache = False
-            if self.trader and self.trader.event_engine:
-                batch_scheduler = self.trader.event_engine.batch_scheduler
-                cached_candles = batch_scheduler.get_cached_candles(code)
-                if cached_candles:
-                    try:
-                        current_price = cached_candles[0].get("close")
-                        main_condition = self.ta.get_main_condition_levels(
-                            cached_candles, period, percent
-                        )
-                        self.watchlist_table.setItem(
-                            row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price))
-                        )
-                        self.watchlist_table.setItem(
-                            row, 3, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("ma")))
-                        )
-                        self.watchlist_table.setItem(
-                            row, 4, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("lower")))
-                        )
-                        has_cache = True
-                    except Exception as e:
-                        self.log(f"[시스템] 감시 종목 캐시 갱신 실패: {code} ({e})")
-                else:
-                    has_cache = batch_scheduler.is_cache_valid(code)
+                has_cache = False
+                if self.trader and self.trader.event_engine:
+                    batch_scheduler = self.trader.event_engine.batch_scheduler
+                    cached_candles = batch_scheduler.get_cached_candles(code)
+                    if cached_candles:
+                        try:
+                            current_price = cached_candles[0].get("close")
+                            main_condition = self.ta.get_main_condition_levels(
+                                cached_candles, period, percent
+                            )
+                            self.watchlist_table.setItem(
+                                row, 2, QTableWidgetItem(self._fmt_int_or_dash(current_price))
+                            )
+                            self.watchlist_table.setItem(
+                                row, 3, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("ma")))
+                            )
+                            self.watchlist_table.setItem(
+                                row, 4, QTableWidgetItem(self._fmt_int_or_dash(main_condition.get("lower")))
+                            )
+                            has_cache = True
+                        except Exception as e:
+                            self.log(f"[시스템] 감시 종목 캐시 갱신 실패: {code} ({e})")
+                    else:
+                        has_cache = batch_scheduler.is_cache_valid(code)
 
-            if not has_cache:
-                already_queued = any(code == s["code"] for _, s in self._watchlist_refresh_queue)
-                if not already_queued:
-                    to_queue.append((row, {"code": code, "name": ""}))
+                if not has_cache:
+                    if code not in self._watchlist_refresh_pending_codes:
+                        to_queue.append({"generation": generation, "row": row, "code": code})
+                        self._watchlist_refresh_pending_codes.add(code)
+        finally:
+            self.watchlist_table.setUpdatesEnabled(True)
 
         if not to_queue:
             return
@@ -1682,6 +1866,12 @@ class MainWindow(QMainWindow):
         self._watchlist_refresh_percent = percent
 
         if not self._is_refreshing_watchlist:
+            self._watchlist_refresh_generation += 1
+            generation = self._watchlist_refresh_generation
+            self._watchlist_refresh_pending_codes.clear()
+            for entry in to_queue:
+                entry["generation"] = generation
+                self._watchlist_refresh_pending_codes.add(entry["code"])
             self._watchlist_refresh_queue = to_queue
             self._watchlist_refresh_total = len(to_queue)
             self._watchlist_refresh_done = 0
@@ -1690,17 +1880,20 @@ class MainWindow(QMainWindow):
             if self.kiwoom and self.kiwoom.is_connected():
                 if show_loading:
                     self._show_watchlist_loading_dialog()
-                QTimer.singleShot(100, self._refresh_watchlist_next)
+                QTimer.singleShot(100, lambda g=generation: self._refresh_watchlist_next(g))
             else:
                 self._is_refreshing_watchlist = False
         else:
             self._watchlist_refresh_queue.extend(to_queue)
             self._watchlist_refresh_total += len(to_queue)
 
-    def _refresh_watchlist_next(self):
+    def _refresh_watchlist_next(self, generation=None):
         """비동기로 감시 종목 정보를 하나씩 갱신 (TR 큐 기반)"""
         if self._is_stopping:
             self._is_refreshing_watchlist = False
+            return
+
+        if generation is not None and generation != self._watchlist_refresh_generation:
             return
 
         if not self._watchlist_refresh_queue:
@@ -1712,31 +1905,43 @@ class MainWindow(QMainWindow):
             self._is_refreshing_watchlist = False
             return
 
-        row, stock = self._watchlist_refresh_queue.pop(0)
-        code = stock["code"]
+        entry = self._watchlist_refresh_queue.pop(0)
+        row = entry["row"]
+        code = entry["code"]
+        entry_generation = entry["generation"]
+
+        if entry_generation != self._watchlist_refresh_generation:
+            if self._watchlist_refresh_queue:
+                QTimer.singleShot(0, lambda g=self._watchlist_refresh_generation: self._refresh_watchlist_next(g))
+            else:
+                self._is_refreshing_watchlist = False
+            return
 
         # 테이블 행 유효성 확인
         if row >= self.watchlist_table.rowCount():
             # 테이블이 리셋되었을 수 있음, 다음 종목으로 진행
             if self._watchlist_refresh_queue:
-                QTimer.singleShot(100, self._refresh_watchlist_next)
+                QTimer.singleShot(100, lambda g=entry_generation: self._refresh_watchlist_next(g))
             else:
                 self._is_refreshing_watchlist = False
             return
 
         # ✅ TR 큐에 일봉 조회 요청 추가 (row, code를 클로저로 캡처)
-        def on_candles_received(candles, r=row, c=code):
-            self._on_watchlist_candles_received(r, c, candles)
+        def on_candles_received(candles, g=entry_generation, r=row, c=code):
+            self._on_watchlist_candles_received(g, r, c, candles)
 
         count = max(self._watchlist_refresh_period + 5, 25)
         self.kiwoom.get_daily_candles_async(code, on_candles_received, count)
 
-    def _on_watchlist_candles_received(self, row, code, candles):
+    def _on_watchlist_candles_received(self, generation, row, code, candles):
         """감시종목 일봉 조회 결과 콜백"""
         try:
+            if generation != self._watchlist_refresh_generation:
+                return
+
             # 테이블 행 유효성 재확인
             if row >= self.watchlist_table.rowCount():
-                self._continue_watchlist_refresh()
+                self._continue_watchlist_refresh(generation, code)
                 return
 
             if candles and len(candles) > 0:
@@ -1752,25 +1957,28 @@ class MainWindow(QMainWindow):
                 if self.trader and self.trader.event_engine:
                     self.trader.event_engine.batch_scheduler.update_cache(code, candles)
 
-                self._continue_watchlist_refresh()
+                self._continue_watchlist_refresh(generation, code)
             else:
                 # 일봉 데이터 실패 시 현재가만이라도 조회 (opt10001 fallback - 큐 기반)
                 self.log(f"[시스템] [{code}] 일봉 데이터 없음, 현재가 조회 시도...")
 
-                def on_stock_info_received(stock_info, r=row, c=code):
-                    self._on_watchlist_stock_info_received(r, c, stock_info)
+                def on_stock_info_received(stock_info, g=generation, r=row, c=code):
+                    self._on_watchlist_stock_info_received(g, r, c, stock_info)
 
                 self.kiwoom.get_stock_info_async(code, on_stock_info_received)
 
         except Exception as e:
             self.log(f"[시스템] [{code}] 일봉 처리 오류: {e}")
-            self._continue_watchlist_refresh()
+            self._continue_watchlist_refresh(generation, code)
 
-    def _on_watchlist_stock_info_received(self, row, code, stock_info):
+    def _on_watchlist_stock_info_received(self, generation, row, code, stock_info):
         """감시종목 현재가 조회 결과 콜백 (fallback)"""
         try:
+            if generation != self._watchlist_refresh_generation:
+                return
+
             if row >= self.watchlist_table.rowCount():
-                self._continue_watchlist_refresh()
+                self._continue_watchlist_refresh(generation, code)
                 return
 
             if stock_info and stock_info.get("price", 0) > 0:
@@ -1785,10 +1993,15 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.log(f"[시스템] [{code}] 현재가 처리 오류: {e}")
 
-        self._continue_watchlist_refresh()
+        self._continue_watchlist_refresh(generation, code)
 
-    def _continue_watchlist_refresh(self):
+    def _continue_watchlist_refresh(self, generation, code=None):
         """감시종목 갱신 계속 진행"""
+        if generation != self._watchlist_refresh_generation:
+            return
+
+        if code:
+            self._watchlist_refresh_pending_codes.discard(code)
         self._watchlist_refresh_done += 1
 
         # 진행률 업데이트
@@ -1805,11 +2018,10 @@ class MainWindow(QMainWindow):
 
         if self._watchlist_refresh_queue:
             # 다음 종목은 TR 큐가 알아서 순차 처리하므로 바로 호출
-            QTimer.singleShot(50, self._refresh_watchlist_next)
+            QTimer.singleShot(50, lambda g=generation: self._refresh_watchlist_next(g))
         else:
             self._hide_watchlist_loading_dialog()
             self._is_refreshing_watchlist = False
-            self.watchlist_table.viewport().update()
             self.watchlist_table.viewport().update()
 
     def _show_watchlist_loading_dialog(self):
@@ -1817,7 +2029,6 @@ class MainWindow(QMainWindow):
         if self._watchlist_loading_dialog is None:
             self._watchlist_loading_dialog = WatchlistLoadingDialog(self)
         self._watchlist_loading_dialog.show()
-        QApplication.processEvents()
 
     def _hide_watchlist_loading_dialog(self):
         """감시 종목 로딩 알림창 닫기"""
@@ -1870,9 +2081,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_watchlist_realtime_registration(self):
         """감시종목 실시간 등록 상태 갱신"""
-        if not self.kiwoom or not self.kiwoom.is_connected():
-            return
-        self._register_watchlist_realtime()
+        self._schedule_watchlist_realtime_registration()
 
     def add_to_watchlist(self):
         """감시 종목 추가 (종목코드 또는 종목명으로 검색)"""
@@ -1947,18 +2156,9 @@ class MainWindow(QMainWindow):
             self.log(f"[시스템] 감시 종목 추가: {code} {name}")
             self.add_code_input.clear()
             # 부분 갱신: 추가된 종목만 TR 큐에 넣고 전체 갱신은 타이머 유지
-            row = self.watchlist_table.rowCount()
-            self.watchlist_table.setRowCount(row + 1)
-            self._watchlist_code_to_row[code] = row
-            self.watchlist_table.setItem(row, 0, QTableWidgetItem(code))
-            self.watchlist_table.setItem(row, 1, QTableWidgetItem(name))
-            self.watchlist_table.setItem(row, 2, QTableWidgetItem("-"))
-            self.watchlist_table.setItem(row, 3, QTableWidgetItem("-"))
-            self.watchlist_table.setItem(row, 4, QTableWidgetItem("-"))
-            self.watchlist_table.viewport().update()
-
+            self._append_watchlist_row(code, name)
             self._refresh_watchlist_for_codes([code])
-            self._refresh_watchlist_realtime_registration()
+            self._schedule_watchlist_realtime_registration()
         else:
             QMessageBox.warning(self, "오류", message)
 
@@ -2746,7 +2946,7 @@ class MainWindow(QMainWindow):
 
     def _on_scan_result(self, results):
         self._scan_result_cache = {r["code"]: r for r in results}
-        self._refresh_scan_table()
+        self._schedule_scan_table_refresh()
         now = datetime.datetime.now().strftime("%H:%M:%S")
         if hasattr(self, 'sc_last_scan_lbl'):
             self.sc_last_scan_lbl.setText(f"마지막 갱신: {now}")
@@ -2770,112 +2970,15 @@ class MainWindow(QMainWindow):
         success, message = self.config.add_to_watchlist(code, name)
         if success:
             self.log(f"[시스템] 감시 종목 추가 (탐색): {code} {name}")
-            tbl_row = self.watchlist_table.rowCount()
-            self.watchlist_table.setRowCount(tbl_row + 1)
-            self._watchlist_code_to_row[code] = tbl_row
-            self.watchlist_table.setItem(tbl_row, 0, QTableWidgetItem(code))
-            self.watchlist_table.setItem(tbl_row, 1, QTableWidgetItem(name))
-            self.watchlist_table.setItem(tbl_row, 2, QTableWidgetItem("-"))
-            self.watchlist_table.setItem(tbl_row, 3, QTableWidgetItem("-"))
-            self.watchlist_table.setItem(tbl_row, 4, QTableWidgetItem("-"))
-            self.watchlist_table.viewport().update()
+            self._append_watchlist_row(code, name)
             self._refresh_watchlist_for_codes([code])
-            self._refresh_watchlist_realtime_registration()
+            self._schedule_watchlist_realtime_registration()
             QMessageBox.information(self, "추가 완료", f"{name} ({code}) 종목이 감시 종목에 추가되었습니다.")
         else:
             QMessageBox.warning(self, "오류", message)
 
     def _refresh_scan_table(self):
-        if not hasattr(self, 'sc_result_table'):
-            return
-        rows = list(self._scan_result_cache.values())
-        self.sc_result_table.setSortingEnabled(False)
-        self.sc_result_table.setRowCount(len(rows))
-
-        for r_idx, row in enumerate(rows):
-            code   = row.get("code", "")
-            name   = row.get("name", "")
-            price  = row.get("price", 0)
-            rsi    = row.get("rsi")
-            ma     = row.get("ma")
-            ma_s   = row.get("ma_short")
-            vr     = row.get("volume_ratio")
-            bo     = row.get("breakout", False)
-            supply_ok = row.get("supply_ok", False)
-            supply_data_available = row.get("supply_data_available", True)
-            tv     = row.get("trading_value")
-            tv_ratio = row.get("trading_value_ratio")
-
-            self._sc_set(r_idx, 0, f"{name} ({code})")
-            self._sc_set(r_idx, 1, f"{int(price):,}" if price else "-",
-                         align=Qt.AlignRight | Qt.AlignVCenter)
-
-            rsi_txt = f"{rsi:.1f}" if rsi is not None else "-"
-            item_rsi = self._sc_make_item(rsi_txt, align=Qt.AlignCenter)
-            if rsi is not None:
-                if rsi <= 30:
-                    item_rsi.setForeground(QColor("#1565C0"))
-                elif rsi >= 70:
-                    item_rsi.setForeground(QColor("#c62828"))
-            self.sc_result_table.setItem(r_idx, 2, item_rsi)
-
-            if ma_s is not None and ma is not None:
-                ma_txt = f"단{int(ma_s):,} / 장{int(ma):,}"
-            elif ma is not None:
-                dir_txt = "↑" if price > ma else "↓"
-                ma_txt = f"{int(ma):,} {dir_txt}"
-            else:
-                ma_txt = "-"
-            self._sc_set(r_idx, 3, ma_txt, align=Qt.AlignCenter)
-
-            scan_cfg = self.scan_config.get_scan()
-            vr_txt = f"{vr:.1f}x" if vr is not None else "-"
-            item_vr = self._sc_make_item(vr_txt, align=Qt.AlignCenter)
-            if vr is not None and vr >= float(scan_cfg.get("volume_ratio") or 2):
-                item_vr.setForeground(QColor("#e65100"))
-            self.sc_result_table.setItem(r_idx, 4, item_vr)
-
-            bo_txt = "●" if bo else "-"
-            item_bo = self._sc_make_item(bo_txt, align=Qt.AlignCenter)
-            if bo:
-                item_bo.setForeground(QColor("#2e7d32"))
-            self.sc_result_table.setItem(r_idx, 5, item_bo)
-
-            supply_enabled = bool(scan_cfg.get("supply_enabled"))
-            if not supply_enabled:
-                supply_txt, supply_color = "-", None
-            elif not supply_data_available:
-                supply_txt, supply_color = "?", QColor("#ef6c00")
-            elif supply_ok:
-                supply_txt, supply_color = "●", QColor("#6a1b9a")
-            else:
-                supply_txt, supply_color = "✕", QColor("#9e9e9e")
-            item_sup = self._sc_make_item(supply_txt, align=Qt.AlignCenter)
-            if supply_color:
-                item_sup.setForeground(supply_color)
-            self.sc_result_table.setItem(r_idx, 6, item_sup)
-
-            tv_enabled = bool(scan_cfg.get("trading_value_enabled"))
-            if not tv_enabled or tv is None:
-                tv_txt = "-"
-            else:
-                tv_bil = tv / 100
-                tv_txt = f"{tv_bil:,.0f}억 ({tv_ratio:.0f}%)" if tv_ratio is not None else f"{tv_bil:,.0f}억"
-            item_tv = self._sc_make_item(tv_txt, align=Qt.AlignRight | Qt.AlignVCenter)
-            if tv_enabled and row.get("trading_value_ok"):
-                item_tv.setForeground(QColor("#1565C0"))
-            self.sc_result_table.setItem(r_idx, 7, item_tv)
-
-            conds = []
-            if row.get("rsi_ok"):           conds.append("RSI")
-            if row.get("ma_ok"):            conds.append("MA")
-            if row.get("volume_ok"):        conds.append("거래량")
-            if row.get("breakout"):         conds.append("돌파")
-            if row.get("supply_ok"):        conds.append("수급")
-            if row.get("trading_value_ok"): conds.append("거래대금")
-            self._sc_set(r_idx, 8, " / ".join(conds) if conds else "-")
-
-        self.sc_result_table.setSortingEnabled(True)
+        self._schedule_scan_table_refresh()
 
     def _sc_set(self, r, c, text, align=Qt.AlignLeft | Qt.AlignVCenter):
         self.sc_result_table.setItem(r, c, self._sc_make_item(text, align))

@@ -213,6 +213,7 @@ class Scanner:
         self._phase        = "idle"   # "phase1" | "phase2" | "phase3" | "idle"
         self._scan_started_at = None
         self._next_refresh_at = None
+        self._active_fingerprint = None
 
         self._top_codes: list  = []
         self._avg_volumes: dict = {}
@@ -262,6 +263,7 @@ class Scanner:
 
         conditions   = self.config.get_scan()
         fp_current   = _get_fingerprint(conditions)
+        self._active_fingerprint = fp_current
         saved_codes, fp_saved = _load_top_codes_cache()
 
         if saved_codes and fp_current == fp_saved:
@@ -688,6 +690,28 @@ class Scanner:
             return
 
         conditions = self.config.get_scan()
+        fp_current = _get_fingerprint(conditions)
+        if fp_current != self._active_fingerprint:
+            self._log(f"[설정] 랭킹 기준 변경 감지 ({self._active_fingerprint} -> {fp_current})")
+            self._active_fingerprint = fp_current
+            self._cancelled = False
+            self._is_scanning = True
+            self._scan_started_at = time.time()
+            self._next_refresh_at = None
+            self._refresh_timer.stop()
+            self._rt_eval_timer.stop()
+
+            saved_codes, fp_saved = _load_top_codes_cache()
+            if saved_codes and fp_saved == fp_current:
+                self._top_codes = saved_codes
+                self._log(f"[설정] 저장된 상위 {len(saved_codes)}종목 재사용 후 재스캔")
+                self._run_phase2()
+            else:
+                self._log("[설정] 상위 종목 재구성 시작")
+                self._phase = "phase1"
+                self._start_opt10030_fetch()
+            return
+
         if conditions.get("supply_enabled"):
             now = time.time()
             needs_fetch = any(
