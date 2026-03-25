@@ -21,6 +21,7 @@ QThread 사용 없음.
 import json
 import os
 import time
+import threading
 from datetime import datetime
 
 from PyQt5.QtCore import QTimer
@@ -48,6 +49,11 @@ RT_CACHE:       dict = {}   # code → (price: int, cum_vol: int)
 _candle_file_loaded   = False   # 파일 캐시 1회 로드 여부
 _investor_file_loaded = False
 
+# ── 캐시 접근 잠금 (TR 콜백 ↔ 실시간 콜백 ↔ 파일 I/O 동시 접근 방지) ─────────
+_CANDLE_LOCK   = threading.Lock()
+_INVESTOR_LOCK = threading.Lock()
+_RT_LOCK       = threading.Lock()
+
 
 # ── 캔들 캐시 파일 I/O ─────────────────────────────────────────────────────────
 def _load_candle_cache_from_file():
@@ -60,11 +66,12 @@ def _load_candle_cache_from_file():
             raw = json.load(f)
         now = time.time()
         loaded = 0
-        for code, entry in raw.items():
-            # 24시간 이내 데이터만 로드
-            if now - entry.get("ts", 0) < _CANDLE_FILE_TTL:
-                CANDLE_CACHE[code] = entry
-                loaded += 1
+        with _CANDLE_LOCK:
+            for code, entry in raw.items():
+                # 24시간 이내 데이터만 로드
+                if now - entry.get("ts", 0) < _CANDLE_FILE_TTL:
+                    CANDLE_CACHE[code] = entry
+                    loaded += 1
         print(f"[캔들캐시] 파일에서 {loaded}개 로드 ({len(raw) - loaded}개 만료 제거)")
     except Exception as e:
         print(f"[캔들캐시] 파일 로드 실패: {e}")
@@ -73,11 +80,8 @@ def _load_candle_cache_from_file():
 def _save_candle_cache_to_file(top_codes: list):
     """상위 N 종목의 캔들만 파일로 저장 (재시작 후 재사용)."""
     try:
-        to_save = {
-            code: CANDLE_CACHE[code]
-            for code in top_codes
-            if code in CANDLE_CACHE
-        }
+        with _CANDLE_LOCK:
+            to_save = {code: CANDLE_CACHE[code] for code in top_codes if code in CANDLE_CACHE}
         with open(_CANDLE_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(to_save, f, ensure_ascii=False)
         print(f"[캔들캐시] {len(to_save)}개 파일 저장 완료")
@@ -96,10 +100,11 @@ def _load_investor_cache_from_file():
             raw = json.load(f)
         now = time.time()
         loaded = 0
-        for code, entry in raw.items():
-            if now - entry.get("ts", 0) < _INVESTOR_FILE_TTL:
-                INVESTOR_CACHE[code] = entry
-                loaded += 1
+        with _INVESTOR_LOCK:
+            for code, entry in raw.items():
+                if now - entry.get("ts", 0) < _INVESTOR_FILE_TTL:
+                    INVESTOR_CACHE[code] = entry
+                    loaded += 1
         print(f"[수급캐시] 파일에서 {loaded}개 로드 ({len(raw) - loaded}개 만료 제거)")
     except Exception as e:
         print(f"[수급캐시] 파일 로드 실패: {e}")
@@ -110,11 +115,8 @@ def _load_investor_cache_from_file():
 def _save_investor_cache_to_file(top_codes: list):
     """상위 N 종목의 수급 데이터만 파일로 저장."""
     try:
-        to_save = {
-            code: INVESTOR_CACHE[code]
-            for code in top_codes
-            if code in INVESTOR_CACHE
-        }
+        with _INVESTOR_LOCK:
+            to_save = {code: INVESTOR_CACHE[code] for code in top_codes if code in INVESTOR_CACHE}
         with open(_INVESTOR_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(to_save, f, ensure_ascii=False)
         print(f"[수급캐시] {len(to_save)}개 파일 저장 완료")
@@ -476,7 +478,8 @@ class Scanner:
             return
 
         if candles:
-            CANDLE_CACHE[code] = {"data": candles, "ts": time.time()}
+            with _CANDLE_LOCK:
+                CANDLE_CACHE[code] = {"data": candles, "ts": time.time()}
         self._process_candle(code, candles or [])
 
         self._tr_done += 1
@@ -563,7 +566,8 @@ class Scanner:
             return
 
         if data:  # 빈 응답이 아니면 항상 캐시 (0값 포함)
-            INVESTOR_CACHE[code] = {"data": data, "ts": time.time()}
+            with _INVESTOR_LOCK:
+                INVESTOR_CACHE[code] = {"data": data, "ts": time.time()}
 
         self._investor_done += 1
         name  = self.kiwoom.get_stock_name_from_cache(code) or code
@@ -763,7 +767,8 @@ class Scanner:
 
     # ── 실시간 가격·거래량 수신 ──────────────────────────────────────────────
     def _on_realtime(self, code: str, price: int, cum_vol: int):
-        RT_CACHE[code] = (price, cum_vol)
+        with _RT_LOCK:
+            RT_CACHE[code] = (price, cum_vol)
         if not self._rt_eval_timer.isActive():
             self._rt_eval_timer.start(500)
 

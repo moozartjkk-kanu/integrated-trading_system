@@ -103,6 +103,9 @@ class AutoTrader:
         self._market_type_timer = QTimer()
         self._market_type_timer.setInterval(30 * 1000)
         self._market_type_timer.timeout.connect(self._check_market_transition)
+        self._worker_health_timer = QTimer()
+        self._worker_health_timer.setInterval(10 * 1000)  # 10초마다 워커 생존 확인
+        self._worker_health_timer.timeout.connect(self._check_worker_health)
         # 주문 복원 완료 여부
         self.orders_restored = False
 
@@ -264,6 +267,7 @@ class AutoTrader:
             self._worker_stop.clear()
             self._signal_worker = threading.Thread(target=self._signal_worker_loop, daemon=True)
             self._signal_worker.start()
+        self._worker_health_timer.start()
         self.log(f"감시 종목: {len(watchlist_codes)}개, 보유 종목(우선): {len(priority_codes)}개")
         return True
 
@@ -274,6 +278,8 @@ class AutoTrader:
 
         if self._market_type_timer:
             self._market_type_timer.stop()
+        if self._worker_health_timer:
+            self._worker_health_timer.stop()
 
         # 워커 정지
         self._worker_stop.set()
@@ -359,6 +365,15 @@ class AutoTrader:
         except Exception as e:
             self.log(f"시장 전환 감지 오류: {e}", "ERROR")
 
+    def _check_worker_health(self):
+        """신호 워커 스레드 생존 확인 — 비정상 종료 시 자동 재시작 (10초 주기)"""
+        if not self.is_running:
+            return
+        if self._signal_worker and not self._signal_worker.is_alive() and not self._worker_stop.is_set():
+            self.log("[워커] 스레드 비정상 종료 감지 — 자동 재시작", "ERROR")
+            self._signal_worker = threading.Thread(target=self._signal_worker_loop, daemon=True)
+            self._signal_worker.start()
+
     def is_any_trading_time(self):
         """어떤 형태로든 거래 가능한 시간인지 확인 (정규장 또는 장시간외)"""
         return self.get_current_market_type() in ("REGULAR", "NXT_PREMARKET", "NXT_AFTERMARKET")
@@ -392,33 +407,44 @@ class AutoTrader:
     # ==================== 워커(조건 계산) ====================
     def _signal_worker_loop(self):
         """tick_queue 소비 → (캐시된 candles로) 조건 계산 → 주문 의도(order_queue)에 적재"""
-        while not self._worker_stop.is_set():
-            try:
-                code, price, ts = self.tick_queue.get(timeout=0.5)
-            except Exception:
-                continue
-
-            if not self.is_running or not self.event_engine:
-                continue
-
-            # 봉데이터는 캐시만 사용 (TR 호출 금지)
-            candles = None
-            try:
-                candles = self.event_engine.batch_scheduler.get_cached_candles(code)
-            except Exception:
-                candles = None
-
-            if not candles:
-                continue
-
-            intents = self._evaluate_intents(code, price, candles)
-            for intent in intents:
-                intent_type = intent.get("type")
-                target_q = self.urgent_order_queue if intent_type in ("stoploss", "buy", "additional_buy") else self.order_queue
+        self.log("[워커] 신호 워커 스레드 시작", "INFO")
+        try:
+            while not self._worker_stop.is_set():
                 try:
-                    target_q.put_nowait(intent)
-                except queue.Full:
-                    break
+                    code, price, ts = self.tick_queue.get(timeout=0.5)
+                except Exception:
+                    continue
+
+                try:
+                    if not self.is_running or not self.event_engine:
+                        continue
+
+                    # 봉데이터는 캐시만 사용 (TR 호출 금지)
+                    candles = None
+                    try:
+                        candles = self.event_engine.batch_scheduler.get_cached_candles(code)
+                    except Exception:
+                        candles = None
+
+                    if not candles:
+                        continue
+
+                    intents = self._evaluate_intents(code, price, candles)
+                    for intent in intents:
+                        intent_type = intent.get("type")
+                        target_q = self.urgent_order_queue if intent_type in ("stoploss", "buy", "additional_buy") else self.order_queue
+                        try:
+                            target_q.put_nowait(intent)
+                        except queue.Full:
+                            break
+
+                except Exception as e:
+                    self.log(f"[워커] 틱 처리 중 예외 (계속 실행): {e}", "ERROR")
+
+        except Exception as e:
+            self.log(f"[워커] 치명적 오류 — 스레드 종료: {e}", "ERROR")
+        finally:
+            self.log("[워커] 신호 워커 스레드 종료", "INFO")
 
     def _evaluate_intents(self, code, current_price, candles):
         """주문을 직접 실행하지 않고, 실행해야 할 주문 의도(intent) 목록을 반환"""
@@ -1821,32 +1847,33 @@ class AutoTrader:
                     })
 
                     if is_buy:
-                        position = self.config.get_position(code)
-                        if position:
-                            old_executed_price = position.get("last_executed_price", 0)
-                            old_executed_qty = position.get("last_executed_qty", 0)
+                        with self.config.position_lock:
+                            position = self.config.get_position(code)
+                            if position:
+                                old_executed_price = position.get("last_executed_price", 0)
+                                old_executed_qty = position.get("last_executed_qty", 0)
 
-                            if old_executed_qty > 0 and old_executed_price > 0:
-                                total_qty = old_executed_qty + executed_qty
-                                new_executed_price = ((old_executed_price * old_executed_qty) + (executed_price * executed_qty)) / total_qty
-                                position["last_executed_price"] = int(new_executed_price)
-                                position["last_executed_qty"] = total_qty
-                            else:
-                                position["last_executed_price"] = executed_price
-                                position["last_executed_qty"] = executed_qty
+                                if old_executed_qty > 0 and old_executed_price > 0:
+                                    total_qty = old_executed_qty + executed_qty
+                                    new_executed_price = ((old_executed_price * old_executed_qty) + (executed_price * executed_qty)) / total_qty
+                                    position["last_executed_price"] = int(new_executed_price)
+                                    position["last_executed_qty"] = total_qty
+                                else:
+                                    position["last_executed_price"] = executed_price
+                                    position["last_executed_qty"] = executed_qty
 
-                            # ✅ 체결된 매수 주문의 buy_count 찾아서 포지션 업데이트
-                            pending_orders = self.config.get_pending_orders().get(code, [])
-                            for order in pending_orders:
-                                if order.get("order_type") == "buy" and int(order.get("price", 0)) == int(executed_price):
-                                    order_buy_count = order.get("buy_count", 1)
-                                    current_buy_count = position.get("buy_count", 0)
-                                    if order_buy_count > current_buy_count:
-                                        position["buy_count"] = order_buy_count
-                                        self.log(f"[{code}] {order_buy_count}차 매수 체결 확인", "INFO")
-                                    break
+                                # ✅ 체결된 매수 주문의 buy_count 찾아서 포지션 업데이트
+                                pending_orders = self.config.get_pending_orders().get(code, [])
+                                for order in pending_orders:
+                                    if order.get("order_type") == "buy" and int(order.get("price", 0)) == int(executed_price):
+                                        order_buy_count = order.get("buy_count", 1)
+                                        current_buy_count = position.get("buy_count", 0)
+                                        if order_buy_count > current_buy_count:
+                                            position["buy_count"] = order_buy_count
+                                            self.log(f"[{code}] {order_buy_count}차 매수 체결 확인", "INFO")
+                                        break
 
-                            self.config.update_position(code, position)
+                                self.config.update_position(code, position)
 
                         # 체결 발생 시 pending 해제 (완전 체결/취소 시점에만)
                         if remaining_quantity == 0:
@@ -1871,44 +1898,46 @@ class AutoTrader:
 
                     else:
                         # ✅ 매도 체결 시 sold_targets 업데이트
-                        position = self.config.get_position(code)
                         target_name = ""
                         is_auto_sell = False
 
-                        if position:
-                            # 체결된 매도 주문의 target_name 찾기 (자동매도 여부 판단)
-                            pending_orders = self.config.get_pending_orders().get(code, [])
-                            for order in pending_orders:
-                                if order.get("order_type") != "sell":
-                                    continue
+                        with self.config.position_lock:
+                            position = self.config.get_position(code)
 
-                                # 1) 주문번호로 우선 매칭
-                                if order_no and order.get("order_no") == order_no:
-                                    target_name = order.get("target_name", "")
-                                # 2) 주문가/수량으로 매칭 (시장가/수동매도 오인 방지)
-                                elif order_price > 0 and int(order.get("price", 0) or 0) == order_price:
-                                    if order_quantity and int(order.get("quantity", 0) or 0) == order_quantity:
+                            if position:
+                                # 체결된 매도 주문의 target_name 찾기 (자동매도 여부 판단)
+                                pending_orders = self.config.get_pending_orders().get(code, [])
+                                for order in pending_orders:
+                                    if order.get("order_type") != "sell":
+                                        continue
+
+                                    # 1) 주문번호로 우선 매칭
+                                    if order_no and order.get("order_no") == order_no:
                                         target_name = order.get("target_name", "")
-                                else:
-                                    target_name = ""
+                                    # 2) 주문가/수량으로 매칭 (시장가/수동매도 오인 방지)
+                                    elif order_price > 0 and int(order.get("price", 0) or 0) == order_price:
+                                        if order_quantity and int(order.get("quantity", 0) or 0) == order_quantity:
+                                            target_name = order.get("target_name", "")
+                                    else:
+                                        target_name = ""
 
-                                if target_name:
-                                    is_auto_sell = True  # ✅ 자동매도
-                                    sold_targets = position.get("sold_targets", [])
-                                    if target_name not in sold_targets:
-                                        sold_targets.append(target_name)
-                                        position["sold_targets"] = sold_targets
-                                        position["sell_occurred"] = True
-                                        self.config.update_position(code, position)
-                                        self.log(f"[{code}] {target_name} 매도 체결 완료 (자동)", "SUCCESS")
+                                    if target_name:
+                                        is_auto_sell = True  # ✅ 자동매도
+                                        sold_targets = position.get("sold_targets", [])
+                                        if target_name not in sold_targets:
+                                            sold_targets.append(target_name)
+                                            position["sold_targets"] = sold_targets
+                                            position["sell_occurred"] = True
+                                            self.config.update_position(code, position)
+                                            self.log(f"[{code}] {target_name} 매도 체결 완료 (자동)", "SUCCESS")
 
-                                        # ✅ 매도 발생 시 미체결 매수 주문 취소 (지연 실행)
-                                        QTimer.singleShot(0, partial(self._cancel_pending_buy_orders, code))
-                                    break
+                                            # ✅ 매도 발생 시 미체결 매수 주문 취소 (지연 실행)
+                                            QTimer.singleShot(0, partial(self._cancel_pending_buy_orders, code))
+                                        break
 
-                            # placed_sell_orders에서 해당 타겟 제거
-                            if code in self.placed_sell_orders and target_name in self.placed_sell_orders[code]:
-                                del self.placed_sell_orders[code][target_name]
+                                # placed_sell_orders에서 해당 타겟 제거
+                                if code in self.placed_sell_orders and target_name in self.placed_sell_orders[code]:
+                                    del self.placed_sell_orders[code][target_name]
 
                         # ✅ 자동매도 플래그 설정 (balance에서 재계산 여부 판단용)
                         if is_auto_sell:
@@ -1923,90 +1952,91 @@ class AutoTrader:
                 quantity = data["quantity"]
                 avg_price = data["avg_price"]
 
-                position = self.config.get_position(code)
-                if position:
-                    old_quantity = position.get("quantity", 0)
-                    position["quantity"] = quantity
-                    position["avg_price"] = avg_price
-                    position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                with self.config.position_lock:
+                    position = self.config.get_position(code)
+                    if position:
+                        old_quantity = position.get("quantity", 0)
+                        position["quantity"] = quantity
+                        position["avg_price"] = avg_price
+                        position["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                    # ✅ 매수로 인한 수량 증가 시
-                    if quantity > old_quantity:
-                        is_additional_buy = old_quantity > 0  # 추가 매수 여부
+                        # ✅ 매수로 인한 수량 증가 시
+                        if quantity > old_quantity:
+                            is_additional_buy = old_quantity > 0  # 추가 매수 여부
 
-                        if is_additional_buy:
-                            # ✅ 추가 매수: 기존 매도 주문 취소 후 새 수량 기준으로 재발주
-                            self.log(f"[{code}] 추가 매수 체결 - 매도 주문 재계산 ({old_quantity}주 → {quantity}주)", "INFO")
+                            if is_additional_buy:
+                                # ✅ 추가 매수: 기존 매도 주문 취소 후 새 수량 기준으로 재발주
+                                self.log(f"[{code}] 추가 매수 체결 - 매도 주문 재계산 ({old_quantity}주 → {quantity}주)", "INFO")
 
-                            # ✅ 기존 매도 주문 취소 (지연 실행 - 콜백 내 QEventLoop 중첩 방지)
-                            def _cancel_sell_orders(stock_code=code):
-                                try:
-                                    cancelled = self.kiwoom.cancel_sell_orders_for_stock(self.account, stock_code)
-                                    if cancelled > 0:
-                                        self.log(f"[{stock_code}] 기존 매도 주문 {cancelled}건 취소", "INFO")
-                                except Exception as e:
-                                    self.log(f"[{stock_code}] 기존 매도 주문 취소 오류: {e}", "ERROR")
+                                # ✅ 기존 매도 주문 취소 (지연 실행 - 콜백 내 QEventLoop 중첩 방지)
+                                def _cancel_sell_orders(stock_code=code):
+                                    try:
+                                        cancelled = self.kiwoom.cancel_sell_orders_for_stock(self.account, stock_code)
+                                        if cancelled > 0:
+                                            self.log(f"[{stock_code}] 기존 매도 주문 {cancelled}건 취소", "INFO")
+                                    except Exception as e:
+                                        self.log(f"[{stock_code}] 기존 매도 주문 취소 오류: {e}", "ERROR")
 
-                            QTimer.singleShot(0, _cancel_sell_orders)
+                                QTimer.singleShot(0, _cancel_sell_orders)
 
-                            # placed_sell_orders 초기화 (체결 완료된 것만 유지)
-                            sold_targets = position.get("sold_targets", [])
-                            if code in self.placed_sell_orders:
-                                self.placed_sell_orders[code] = {k: v for k, v in self.placed_sell_orders[code].items() if k in sold_targets}
+                                # placed_sell_orders 초기화 (체결 완료된 것만 유지)
+                                sold_targets = position.get("sold_targets", [])
+                                if code in self.placed_sell_orders:
+                                    self.placed_sell_orders[code] = {k: v for k, v in self.placed_sell_orders[code].items() if k in sold_targets}
 
-                            # pending_orders에서 매도 주문 정리
+                                # pending_orders에서 매도 주문 정리
+                                self.config.clear_pending_orders_for_stock(code, order_type="sell")
+
+                            # initial_quantity 설정/갱신 (새로운 총 수량으로)
+                            position["initial_quantity"] = quantity
+                            log_type = "초기" if not is_additional_buy else "갱신"
+                            self.log(f"[{code}] {log_type} 수량 설정: {quantity}주", "INFO")
+
+                            # ✅ 수동매수 플래그 설정 (매도 비중 [30, 40, 30] 적용)
+                            if code in self._manual_buy_codes:
+                                position["is_manual_buy"] = True
+                                self.log(f"[{code}] 수동매수 종목 - 매도 비중 [30, 40, 30] 적용", "INFO")
+
+                            # ✅ 매수 체결 후 매도 주문 설정 (새 수량 기준) - 지연 실행
+                            # position은 dict이므로 copy하여 전달
+                            pos_copy = dict(position)
+                            QTimer.singleShot(0, partial(self._schedule_sell_orders_after_buy, code, pos_copy))
+
+                        # ✅ 매도로 인한 수량 감소 시
+                        elif quantity < old_quantity:
+                            position["sell_occurred"] = True
+                            self.config.update_position(code, position)
+
+                            # ✅ 자동매도인지 수동매도인지 확인
+                            is_auto_sell = self._auto_sell_executed.pop(code, False)
+
+                            if is_auto_sell:
+                                # 자동매도: 초기 비중대로 유지, 재계산 안 함
+                                self.log(f"[{code}] 자동매도 체결 - 기존 매도 주문 유지 (남은 {quantity}주)", "INFO")
+                            else:
+                                # 수동매도: 남은 수량 기준으로 재계산/재발주
+                                if quantity > 0:
+                                    self.log(f"[{code}] 수동매도 체결 - 자동매도 주문 재계산 필요 (남은 {quantity}주)", "INFO")
+                                    # ✅ 동기 TR 포함 함수 지연 실행 (콜백 내 QEventLoop 중첩 방지)
+                                    # position은 dict이므로 copy하여 전달 (이후 변경 가능성 대비)
+                                    pos_copy = dict(position)
+                                    QTimer.singleShot(0, partial(self._recalculate_sell_orders_on_quantity_decrease, code, pos_copy))
+                                # 남은 수량 0이면 아래 if quantity == 0에서 정리
+
+                        self.config.update_position(code, position)
+
+                        # 전량 매도 완료 시 정리
+                        if quantity == 0:
+                            position = self.config.get_position(code) or {}
+                            # pending 주문 삭제
                             self.config.clear_pending_orders_for_stock(code, order_type="sell")
-
-                        # initial_quantity 설정/갱신 (새로운 총 수량으로)
-                        position["initial_quantity"] = quantity
-                        log_type = "초기" if not is_additional_buy else "갱신"
-                        self.log(f"[{code}] {log_type} 수량 설정: {quantity}주", "INFO")
-
-                        # ✅ 수동매수 플래그 설정 (매도 비중 [30, 40, 30] 적용)
-                        if code in self._manual_buy_codes:
-                            position["is_manual_buy"] = True
-                            self.log(f"[{code}] 수동매수 종목 - 매도 비중 [30, 40, 30] 적용", "INFO")
-
-                        # ✅ 매수 체결 후 매도 주문 설정 (새 수량 기준) - 지연 실행
-                        # position은 dict이므로 copy하여 전달
-                        pos_copy = dict(position)
-                        QTimer.singleShot(0, partial(self._schedule_sell_orders_after_buy, code, pos_copy))
-
-                    # ✅ 매도로 인한 수량 감소 시
-                    elif quantity < old_quantity:
-                        position["sell_occurred"] = True
-                        self.config.update_position(code, position)
-
-                        # ✅ 자동매도인지 수동매도인지 확인
-                        is_auto_sell = self._auto_sell_executed.pop(code, False)
-
-                        if is_auto_sell:
-                            # 자동매도: 초기 비중대로 유지, 재계산 안 함
-                            self.log(f"[{code}] 자동매도 체결 - 기존 매도 주문 유지 (남은 {quantity}주)", "INFO")
-                        else:
-                            # 수동매도: 남은 수량 기준으로 재계산/재발주
-                            if quantity > 0:
-                                self.log(f"[{code}] 수동매도 체결 - 자동매도 주문 재계산 필요 (남은 {quantity}주)", "INFO")
-                                # ✅ 동기 TR 포함 함수 지연 실행 (콜백 내 QEventLoop 중첩 방지)
-                                # position은 dict이므로 copy하여 전달 (이후 변경 가능성 대비)
-                                pos_copy = dict(position)
-                                QTimer.singleShot(0, partial(self._recalculate_sell_orders_on_quantity_decrease, code, pos_copy))
-                            # 남은 수량 0이면 아래 if quantity == 0에서 정리
-
-                    self.config.update_position(code, position)
-
-                    # 전량 매도 완료 시 정리
-                    if quantity == 0:
-                        position = self.config.get_position(code) or {}
-                        # pending 주문 삭제
-                        self.config.clear_pending_orders_for_stock(code, order_type="sell")
-                        # placed_sell_orders 정리
-                        if code in self.placed_sell_orders:
-                            del self.placed_sell_orders[code]
-                        # stoploss_price는 0으로 (매도 완료)
-                        position["stoploss_price"] = 0
-                        self.config.update_position(code, position)
-                        self.log(f"[{code}] 전량 매도 완료 - 자동매도 재계산 스킵", "SUCCESS")
+                            # placed_sell_orders 정리
+                            if code in self.placed_sell_orders:
+                                del self.placed_sell_orders[code]
+                            # stoploss_price는 0으로 (매도 완료)
+                            position["stoploss_price"] = 0
+                            self.config.update_position(code, position)
+                            self.log(f"[{code}] 전량 매도 완료 - 자동매도 재계산 스킵", "SUCCESS")
 
                 # ✅ 동기 TR 호출을 지연 실행 (콜백 내 QEventLoop 중첩 방지)
                 QTimer.singleShot(0, self._check_and_cancel_excess_orders)

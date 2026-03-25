@@ -7,6 +7,7 @@ import os
 import hashlib
 import base64
 import uuid
+import threading
 
 try:
     from cryptography.fernet import Fernet
@@ -151,6 +152,7 @@ class Config:
     """설정 관리 클래스"""
 
     def __init__(self):
+        self._position_lock = threading.RLock()  # 포지션 read-modify-write 원자화
         self.config = self.load_config()
 
     def load_config(self):
@@ -194,14 +196,21 @@ class Config:
                 base_dict[key] = value
 
     def save_config(self):
-        """설정 파일 저장 (암호화)"""
+        """설정 파일 저장 (암호화) - 임시 파일에 먼저 쓴 뒤 원자적으로 교체"""
+        tmp_file = CONFIG_FILE + ".tmp"
         try:
             encrypted = _encrypt(self.config)
-            with open(CONFIG_FILE, 'wb') as f:
+            with open(tmp_file, 'wb') as f:
                 f.write(encrypted)
+            os.replace(tmp_file, CONFIG_FILE)  # 원자적 교체 — 중간 크래시로 원본 손상 없음
             return True
         except Exception as e:
             print(f"설정 파일 저장 실패: {e}")
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except Exception:
+                pass
             return False
 
     def get(self, *keys):
@@ -265,11 +274,17 @@ class Config:
         positions = self.get("positions") or {}
         return positions.get(stock_code, None)
 
+    @property
+    def position_lock(self):
+        """포지션 복합 연산(read-modify-write)용 RLock. trading_logic에서 외부 잠금 시 사용."""
+        return self._position_lock
+
     def update_position(self, stock_code, position_data):
-        """포지션 정보 업데이트"""
-        positions = self.get("positions") or {}
-        positions[stock_code] = position_data
-        return self.set(positions, "positions")
+        """포지션 정보 업데이트 (잠금 포함 — 단독 쓰기 또는 position_lock 보유 중 호출 모두 안전)"""
+        with self._position_lock:
+            positions = self.get("positions") or {}
+            positions[stock_code] = position_data
+            return self.set(positions, "positions")
 
     def clear_position(self, stock_code):
         """포지션 정보 삭제"""

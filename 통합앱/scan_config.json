@@ -6,7 +6,7 @@
   "scan": {
     "market": "kospi",
     "condition_mode": "AND",
-    "top_n": 200,
+    "top_n": 100,
     "rsi_enabled": false,
     "rsi_period": 20,
     "rsi_min": 0.0,

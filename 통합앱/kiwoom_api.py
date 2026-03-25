@@ -387,8 +387,9 @@ class KiwoomAPI:
         self._expected_trcode = None
         self._pending_tr_data = {}
         self._tr_timed_out = False
-        # ✅ TR 재진입 방지 플래그 (QEventLoop 중첩 호출 차단)
+        # ✅ TR 재진입 방지 플래그 + 락 (check-and-set 원자화)
         self._tr_busy = False
+        self._tr_lock = Lock()
         # 타임아웃 비활성화 (0 또는 None이면 무제한 대기)
         # opw00018 등 계좌 조회는 시간이 오래 걸릴 수 있음
         self._tr_timeout_ms = 0
@@ -585,20 +586,18 @@ class KiwoomAPI:
 
     def comm_rq_data(self, rqname, trcode, next, screen_no):
         """TR 요청 (Rate Limiting + 재진입 방지 + 쿨다운 적용)"""
-        # ✅ 재진입 방지: 이미 TR 처리 중이면 경고 후 스킵
-        if self._tr_busy:
-            self._debug(f"[TR] BLOCKED (busy) rqname={rqname} trcode={trcode}")
-            return
+        # ✅ check-and-set 원자화: 락 안에서 확인 후 즉시 플래그 선점
+        with self._tr_lock:
+            if self._tr_busy:
+                self._debug(f"[TR] BLOCKED (busy) rqname={rqname} trcode={trcode}")
+                return
+            if self.is_tr_cooldown():
+                self._debug(f"[TR] BLOCKED (cooldown) rqname={rqname} trcode={trcode}")
+                return
+            self._tr_busy = True  # 락 안에서 원자적으로 선점
 
-        # ✅ 쿨다운 중이면 TR 요청 스킵 (-209 에러 방지)
-        if self.is_tr_cooldown():
-            self._debug(f"[TR] BLOCKED (cooldown) rqname={rqname} trcode={trcode}")
-            return
-
-        # TR 호출 제한 대기
+        # 블로킹 대기는 락 밖에서 (다른 스레드를 불필요하게 차단하지 않음)
         self.rate_limiter.wait_if_needed()
-
-        self._tr_busy = True
         self._debug(f"[TR] request rqname={rqname} trcode={trcode}")
         self.tr_data = {}
 
@@ -611,6 +610,10 @@ class KiwoomAPI:
             self.tr_event_loop.exec_()
         finally:
             self._tr_busy = False
+            # QEventLoop 명시적 해제 (매 TR 호출마다 새로 생성되므로 정리 필요)
+            if self.tr_event_loop is not None:
+                self.tr_event_loop.deleteLater()
+                self.tr_event_loop = None
         self._debug(f"[TR] completed rqname={rqname} trcode={trcode}")
 
     def _on_receive_tr_data(self, screen_no, rqname, trcode, record_name, next,
