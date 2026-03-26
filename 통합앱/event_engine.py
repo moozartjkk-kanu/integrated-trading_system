@@ -78,6 +78,11 @@ class BatchScheduler:
     def set_stocks(self, stock_codes):
         """관리할 종목 설정"""
         with self.lock:
+            new_set = set(stock_codes)
+            # 더 이상 관리하지 않는 종목의 캐시 정리
+            for code in list(self.candle_cache.keys()):
+                if code not in new_set:
+                    del self.candle_cache[code]
             self.stocks = list(stock_codes)
             self.current_index = 0
 
@@ -105,6 +110,8 @@ class BatchScheduler:
             if cached:
                 if time.time() - cached["updated_at"] < self.cache_ttl:
                     return cached["candles"]
+                # 만료된 엔트리 즉시 삭제
+                del self.candle_cache[code]
             return None
 
     def update_cache(self, code, candles):
@@ -120,7 +127,10 @@ class BatchScheduler:
         with self.lock:
             cached = self.candle_cache.get(code)
             if cached:
-                return time.time() - cached["updated_at"] < self.cache_ttl
+                if time.time() - cached["updated_at"] < self.cache_ttl:
+                    return True
+                # 만료된 엔트리 즉시 삭제
+                del self.candle_cache[code]
             return False
 
 

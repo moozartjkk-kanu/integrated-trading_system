@@ -23,12 +23,62 @@ _LEGACY_JSON_FILE = "trading_config.json"
 _SECRET = "kiwoom_nxt_alice_4419_secure_cfg"
 
 
+def _get_machine_id() -> str:
+    """
+    안정적인 머신 고유 ID 반환 (MAC 주소 의존 없음)
+
+    우선순위:
+    1. Windows 레지스트리 MachineGuid (OS 재설치 전까지 불변)
+    2. 로컬 .machine_id 파일 (없으면 생성하여 고정)
+    3. MAC 주소 (최후 수단)
+    """
+    # 1순위: Windows 레지스트리 MachineGuid
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography"
+        )
+        value, _ = winreg.QueryValueEx(key, "MachineGuid")
+        winreg.CloseKey(key)
+        if value:
+            return value
+    except Exception:
+        pass
+
+    # 2순위: 로컬 ID 파일 (없으면 랜덤 UUID 생성 후 저장)
+    mid_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".machine_id")
+    try:
+        if os.path.exists(mid_file):
+            with open(mid_file, "r") as f:
+                mid = f.read().strip()
+            if mid:
+                return mid
+        mid = str(uuid.uuid4())
+        with open(mid_file, "w") as f:
+            f.write(mid)
+        return mid
+    except Exception:
+        pass
+
+    # 3순위: MAC 주소 (최후 수단)
+    return str(uuid.getnode())
+
+
 def _derive_key() -> bytes:
     """머신 고유 ID + 내부 시크릿으로 Fernet 키 파생"""
-    machine_id = str(uuid.getnode())  # 네트워크 어댑터 MAC 기반 정수
+    machine_id = _get_machine_id()
     raw = f"{_SECRET}:{machine_id}".encode("utf-8")
     digest = hashlib.sha256(raw).digest()  # 32바이트
     return base64.urlsafe_b64encode(digest)  # Fernet 키 형식
+
+
+def _derive_key_legacy() -> bytes:
+    """구 버전 MAC 기반 키 (마이그레이션 전용)"""
+    machine_id = str(uuid.getnode())
+    raw = f"{_SECRET}:{machine_id}".encode("utf-8")
+    digest = hashlib.sha256(raw).digest()
+    return base64.urlsafe_b64encode(digest)
 
 
 def _encrypt(data: dict) -> bytes:
@@ -45,6 +95,13 @@ def _decrypt(raw: bytes) -> dict:
     if not _CRYPTO_AVAILABLE:
         return json.loads(raw.decode("utf-8"))
     fernet = Fernet(_derive_key())
+    plain = fernet.decrypt(raw)
+    return json.loads(plain.decode("utf-8"))
+
+
+def _decrypt_legacy(raw: bytes) -> dict:
+    """구 버전 MAC 기반 키로 복호화 (마이그레이션 전용)"""
+    fernet = Fernet(_derive_key_legacy())
     plain = fernet.decrypt(raw)
     return json.loads(plain.decode("utf-8"))
 
@@ -159,15 +216,33 @@ class Config:
         """설정 파일 로드 (암호화 .dat 우선, 레거시 .json 자동 마이그레이션)"""
         # 암호화된 .dat 파일 로드 시도
         if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'rb') as f:
+                raw = f.read()
+
+            # 1차: 현재 키(MachineGuid 기반)로 복호화
             try:
-                with open(CONFIG_FILE, 'rb') as f:
-                    raw = f.read()
                 saved_config = _decrypt(raw)
                 merged = DEFAULT_CONFIG.copy()
                 self._deep_update(merged, saved_config)
                 return merged
-            except Exception as e:
-                print(f"설정 파일 로드 실패: {e}")
+            except Exception:
+                pass
+
+            # 2차: 구 MAC 기반 키로 복호화 후 새 키로 재저장 (마이그레이션)
+            if _CRYPTO_AVAILABLE:
+                try:
+                    saved_config = _decrypt_legacy(raw)
+                    merged = DEFAULT_CONFIG.copy()
+                    self._deep_update(merged, saved_config)
+                    encrypted = _encrypt(merged)
+                    tmp_file = CONFIG_FILE + ".tmp"
+                    with open(tmp_file, 'wb') as f:
+                        f.write(encrypted)
+                    os.replace(tmp_file, CONFIG_FILE)
+                    print("설정 파일을 안정적인 머신 ID 기반 키로 마이그레이션했습니다.")
+                    return merged
+                except Exception as e:
+                    print(f"설정 파일 로드 실패: {e}")
 
         # 레거시 평문 JSON이 있으면 읽어서 암호화 파일로 마이그레이션
         if os.path.exists(_LEGACY_JSON_FILE):
